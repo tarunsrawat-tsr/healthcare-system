@@ -1,4 +1,7 @@
 import duckdb
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import IsolationForest
 
 def build_pipeline(csv_path: str, min_support: int = 8) -> duckdb.DuckDBPyConnection:
     con = duckdb.connect()
@@ -66,4 +69,26 @@ def build_pipeline(csv_path: str, min_support: int = 8) -> duckdb.DuckDBPyConnec
             CASE WHEN peer_mad > 0 THEN (markup_ratio - peer_median) / (1.4826 * peer_mad) ELSE 0 END;
     """)
 
+    # 3. Isolation Forest
+    df = con.execute("SELECT provider_id, drg, charges, payments, total_discharges, markup_ratio FROM scored").df()
+    df.fillna(0, inplace=True)
+    
+    iso = IsolationForest(n_estimators=150, contamination=0.01, random_state=42) #[cite: 33]
+    features = ['charges', 'payments', 'total_discharges', 'markup_ratio']
+    df['iforest_flag'] = iso.fit_predict(df[features]) == -1
+    
+    con.register('df_if', df)
+    con.execute("""
+        CREATE TABLE final_results AS 
+        SELECT s.*, i.iforest_flag,
+               (s.robust_z >= 3.5 AND i.iforest_flag) AS flagged_both
+        FROM scored s
+        JOIN df_if i ON s.provider_id = i.provider_id AND s.drg = i.drg
+    """)
     return con
+
+def calculate_psi(expected: np.ndarray, actual: np.ndarray, eps: float = 1e-6) -> float:
+    """Population Stability Index for drift monitoring[cite: 17, 20]."""
+    expected = np.clip(expected / expected.sum(), eps, None)
+    actual = np.clip(actual / actual.sum(), eps, None)
+    return float(np.sum((actual - expected) * np.log(actual / expected)))
