@@ -3,7 +3,7 @@ import requests
 import pandas as pd
 
 # API Configuration
-API_URL = "http://localhost:8000"
+API_URL = "http://healthcare-system-production-f0ff9c93.up.railway.app"
 
 st.set_page_config(page_title="Claimsight Dashboard", layout="wide")
 st.title("Claimsight: Anomaly Detection Dashboard")
