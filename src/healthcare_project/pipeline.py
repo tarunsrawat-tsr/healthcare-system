@@ -1,9 +1,22 @@
 import duckdb
 import numpy as np
 import pandas as pd
+import os
+import json
+import hashlib
+from datetime import datetime
 from sklearn.ensemble import IsolationForest
+from pydantic import BaseModel, Field
 
-def build_pipeline(csv_path: str, min_support: int = 8) -> duckdb.DuckDBPyConnection:
+class PipelineConfig(BaseModel):
+    """Configuration for our model"""
+    csv_path: str
+    min_support: int = Field(default=8, ge=2, description="Minimum peers needed for MAD.")
+    z_threshold: float = Field(default=3.5, ge=0.0, description="Minimum robust Z-score.")
+    contamination: float = Field(default=0.01, gt=0.0, le=0.5, description="iForest fraction.")
+    n_estimators: int = Field(default=150, ge=10, description="Number of trees in iForest.")
+
+def build_pipeline(config: PipelineConfig) -> duckdb.DuckDBPyConnection:
     con = duckdb.connect()
     
     con.execute(f"""
@@ -16,7 +29,7 @@ def build_pipeline(csv_path: str, min_support: int = 8) -> duckdb.DuckDBPyConnec
             CAST(REPLACE("Total Discharges", ',', '') AS BIGINT) AS total_discharges,
             CAST(REPLACE(REPLACE("Average Covered Charges", '$', ''), ',', '') AS DOUBLE) AS charges,
             CAST(REPLACE(REPLACE("Average Medicare Payments", '$', ''), ',', '') AS DOUBLE) AS payments
-        FROM read_csv('{csv_path}', header=true, all_varchar=true)
+        FROM read_csv('{config.csv_path}', header=true, all_varchar=true)
         WHERE "Average Medicare Payments" IS NOT NULL
     """)
     
@@ -52,11 +65,11 @@ def build_pipeline(csv_path: str, min_support: int = 8) -> duckdb.DuckDBPyConnec
         )
         SELECT c.*,
             COALESCE(
-                CASE WHEN h.n >= {min_support} THEN h.med END,
-                CASE WHEN s.n >= {min_support} THEN s.med END, n.med) AS peer_median,
+                CASE WHEN h.n >= {config.min_support} THEN h.med END,
+                CASE WHEN s.n >= {config.min_support} THEN s.med END, n.med) AS peer_median,
             COALESCE(
-                CASE WHEN h.n >= {min_support} THEN h.mad END,
-                CASE WHEN s.n >= {min_support} THEN s.mad END, n.mad) AS peer_mad
+                CASE WHEN h.n >= {config.min_support} THEN h.mad END,
+                CASE WHEN s.n >= {config.min_support} THEN s.mad END, n.mad) AS peer_mad
         FROM claims c
         LEFT JOIN hrr_stats h ON c.drg = h.drg AND c.hrr = h.hrr
         LEFT JOIN state_stats s ON c.drg = s.drg AND c.state = s.state
@@ -73,22 +86,54 @@ def build_pipeline(csv_path: str, min_support: int = 8) -> duckdb.DuckDBPyConnec
     df = con.execute("SELECT provider_id, drg, charges, payments, total_discharges, markup_ratio FROM scored").df()
     df.fillna(0, inplace=True)
     
-    iso = IsolationForest(n_estimators=150, contamination=0.01, random_state=42) #[cite: 33]
+    iso = IsolationForest(
+        n_estimators=config.n_estimators, 
+        contamination=config.contamination, 
+        random_state=42
+    )
     features = ['charges', 'payments', 'total_discharges', 'markup_ratio']
     df['iforest_flag'] = iso.fit_predict(df[features]) == -1
     
     con.register('df_if', df)
-    con.execute("""
+
+    con.execute(f"""
         CREATE TABLE final_results AS 
         SELECT s.*, i.iforest_flag,
-               (s.robust_z >= 3.5 AND i.iforest_flag) AS flagged_both
+               (s.robust_z >= {config.z_threshold} AND i.iforest_flag) AS flagged_both
         FROM scored s
         JOIN df_if i ON s.provider_id = i.provider_id AND s.drg = i.drg
     """)
+
+    run_id = datetime.now().strftime("run_%Y%m%d_%H%M%S")
+    run_dir = f"run_registry/{run_id}"
+    os.makedirs(run_dir, exist_ok=True)
+
+    # Input Hashing (SHA-256)
+    hasher = hashlib.sha256()
+    with open(config.csv_path, 'rb') as f:
+        hasher.update(f.read())
+    file_hash = hasher.hexdigest()
+
+    # Configuration & Version Manifest
+    manifest = {
+        "run_id": run_id,
+        "pipeline_version": "1.0.0",
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "input_file": config.csv_path,
+        "input_hash": file_hash,
+        "hyperparameters": config.model_dump()
+    }
+    
+    with open(os.path.join(run_dir, "manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=4)
+
+    # Parquet Artifact Export
+    parquet_path = os.path.join(run_dir, "scored_results.parquet")
+    con.execute(f"COPY final_results TO '{parquet_path}' (FORMAT PARQUET)")
+
     return con
 
 def calculate_psi(expected: np.ndarray, actual: np.ndarray, eps: float = 1e-6) -> float:
-    """Population Stability Index for drift monitoring[cite: 17, 20]."""
     expected = np.clip(expected / expected.sum(), eps, None)
     actual = np.clip(actual / actual.sum(), eps, None)
     return float(np.sum((actual - expected) * np.log(actual / expected)))
